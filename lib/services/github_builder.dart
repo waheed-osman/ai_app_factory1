@@ -1,0 +1,530 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:archive/archive.dart';
+import 'package:http/http.dart' as http;
+
+import '../core/errors.dart';
+import '../models/build_models.dart';
+import '../models/project_file.dart';
+import 'http_transport.dart';
+
+class RepoRef {
+  const RepoRef({
+    required this.owner,
+    required this.name,
+    required this.branch,
+    required this.htmlUrl,
+  });
+
+  final String owner;
+  final String name;
+  final String branch;
+  final String htmlUrl;
+
+  String get fullName => '$owner/$name';
+
+  String get pagesUrl => 'https://${owner.toLowerCase()}.github.io/$name/';
+}
+
+class RunInfo {
+  const RunInfo({
+    required this.id,
+    required this.status,
+    required this.conclusion,
+    required this.htmlUrl,
+  });
+
+  final int id;
+  final String status;
+  final String? conclusion;
+  final String htmlUrl;
+
+  bool get completed => status == 'completed';
+
+  BuildStatus get buildStatus {
+    if (!completed) {
+      return status == 'in_progress' ? BuildStatus.inProgress : BuildStatus.queued;
+    }
+    switch (conclusion) {
+      case 'success':
+        return BuildStatus.success;
+      case 'cancelled':
+        return BuildStatus.cancelled;
+      default:
+        return BuildStatus.failure;
+    }
+  }
+}
+
+class ArtifactInfo {
+  const ArtifactInfo({
+    required this.id,
+    required this.name,
+    required this.sizeInBytes,
+    required this.expired,
+  });
+
+  final int id;
+  final String name;
+  final int sizeInBytes;
+  final bool expired;
+}
+
+/// التعامل مع GitHub: إنشاء مستودع، رفع الملفات (Git Data API)،
+/// تشغيل الـ workflow، متابعة الحالة، تنزيل الـ Artifacts وسجلات الفشل.
+class GitHubBuilder {
+  GitHubBuilder({required String token, HttpTransport? transport, CancelToken? cancel})
+      : _token = token.trim(),
+        _t = transport ?? HttpTransport(),
+        _cancel = cancel;
+
+  final String _token;
+  final HttpTransport _t;
+  final CancelToken? _cancel;
+
+  Map<String, String> get _headers => {
+        'Authorization': 'Bearer $_token',
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'ai-app-factory',
+        'Content-Type': 'application/json; charset=utf-8',
+      };
+
+  Uri _uri(String path, [Map<String, String>? query]) {
+    final base = Uri.parse('https://api.github.com$path');
+    return query == null ? base : base.replace(queryParameters: query);
+  }
+
+  Future<void> _wait(Duration d) async {
+    var left = d.inMilliseconds;
+    while (left > 0) {
+      _cancel?.check();
+      final step = left > 500 ? 500 : left;
+      await Future<void>.delayed(Duration(milliseconds: step));
+      left -= step;
+    }
+    _cancel?.check();
+  }
+
+  ApiException _error(http.Response res, String action) {
+    var detail = '';
+    try {
+      final d = jsonDecode(utf8.decode(res.bodyBytes));
+      if (d is Map && d['message'] is String) detail = d['message'] as String;
+    } catch (_) {}
+    final code = res.statusCode;
+    String hint;
+    switch (code) {
+      case 401:
+        hint = 'التوكن غير صالح أو منتهي الصلاحية';
+        break;
+      case 403:
+        hint = 'لا توجد صلاحية كافية أو تم تجاوز حد الطلبات';
+        break;
+      case 404:
+        hint = 'غير موجود أو لا يملك التوكن الصلاحية (يلزم repo و workflow)';
+        break;
+      case 422:
+        hint = 'طلب مرفوض من GitHub';
+        break;
+      default:
+        hint = 'خطأ من GitHub';
+    }
+    return ApiException(
+      '$action: $hint [$code]${detail.isEmpty ? '' : ' - $detail'}',
+      statusCode: code,
+      details: detail,
+    );
+  }
+
+  Future<Map<String, dynamic>> _json(
+    String method,
+    String path, {
+    Object? body,
+    Map<String, String>? query,
+    Set<int> ok = const {200, 201},
+    required String action,
+  }) async {
+    _cancel?.check();
+    final res = await _t.send(
+      method,
+      _uri(path, query),
+      headers: _headers,
+      body: body == null ? null : jsonEncode(body),
+    );
+    if (!ok.contains(res.statusCode)) throw _error(res, action);
+    if (res.bodyBytes.isEmpty) return <String, dynamic>{};
+    final d = jsonDecode(utf8.decode(res.bodyBytes));
+    return d is Map<String, dynamic> ? d : <String, dynamic>{'data': d};
+  }
+
+  // ---------------------------------------------------------------- المستودع
+
+  /// اسم المستخدم (ويتحقق من صلاحية التوكن).
+  Future<String> currentUser() async {
+    final d = await _json('GET', '/user', action: 'التحقق من التوكن');
+    final login = d['login'];
+    if (login is! String) throw const FactoryException('تعذر قراءة حساب GitHub.');
+    return login;
+  }
+
+  Future<RepoRef> createRepo(
+    String name, {
+    required bool private,
+    String? description,
+  }) async {
+    final d = await _json(
+      'POST',
+      '/user/repos',
+      body: {
+        'name': name,
+        'description': description ?? 'Generated by AI App Factory',
+        'private': private,
+        'auto_init': true,
+      },
+      action: 'إنشاء المستودع',
+    );
+    return _repoFrom(d);
+  }
+
+  /// مستودع موجود (للبناء على نفس المستودع). null إن لم يوجد أو لا صلاحية.
+  Future<RepoRef?> getRepo(String fullName) async {
+    final res = await _t.send('GET', _uri('/repos/$fullName'), headers: _headers);
+    if (res.statusCode == 404 || res.statusCode == 403) return null;
+    if (res.statusCode != 200) throw _error(res, 'قراءة المستودع');
+    final d = jsonDecode(utf8.decode(res.bodyBytes));
+    if (d is! Map) return null;
+    return _repoFrom(Map<String, dynamic>.from(d));
+  }
+
+  RepoRef _repoFrom(Map<String, dynamic> d) {
+    final owner = d['owner'];
+    return RepoRef(
+      owner: owner is Map ? '${owner['login']}' : '',
+      name: '${d['name']}',
+      branch: '${d['default_branch'] ?? 'main'}',
+      htmlUrl: '${d['html_url']}',
+    );
+  }
+
+  Future<String> _blob(RepoRef r, ProjectFile f) async {
+    final d = await _json(
+      'POST',
+      '/repos/${r.fullName}/git/blobs',
+      body: {'content': base64Encode(f.bytes), 'encoding': 'base64'},
+      action: 'رفع الملف ${f.path}',
+    );
+    return '${d['sha']}';
+  }
+
+  Future<String> _headCommit(RepoRef r) async {
+    for (var i = 0; i < 6; i++) {
+      final res = await _t.send(
+        'GET',
+        _uri('/repos/${r.fullName}/git/ref/heads/${r.branch}'),
+        headers: _headers,
+      );
+      if (res.statusCode == 200) {
+        final d = jsonDecode(utf8.decode(res.bodyBytes));
+        if (d is Map && d['object'] is Map) {
+          return '${(d['object'] as Map)['sha']}';
+        }
+      }
+      if ((res.statusCode == 404 || res.statusCode == 409) && i < 5) {
+        await _wait(const Duration(seconds: 2));
+        continue;
+      }
+      throw _error(res, 'قراءة الفرع ${r.branch}');
+    }
+    throw const FactoryException('تعذر قراءة الفرع الرئيسي للمستودع.');
+  }
+
+  /// يستبدل كامل محتوى الفرع بالملفات المعطاة في Commit واحد، ويرجع sha.
+  Future<String> pushFiles(
+    RepoRef repo,
+    List<ProjectFile> files,
+    String message, {
+    void Function(int done, int total)? onProgress,
+  }) async {
+    final parent = await _headCommit(repo);
+    final shas = List<String>.filled(files.length, '');
+    var next = 0;
+    var done = 0;
+    Future<void> worker() async {
+      while (true) {
+        final i = next++;
+        if (i >= files.length) return;
+        shas[i] = await _blob(repo, files[i]);
+        done++;
+        onProgress?.call(done, files.length);
+      }
+    }
+
+    final workers = files.length < 4 ? files.length : 4;
+    await Future.wait(List.generate(workers, (_) => worker()));
+
+    final tree = await _json(
+      'POST',
+      '/repos/${repo.fullName}/git/trees',
+      body: {
+        'tree': [
+          for (var i = 0; i < files.length; i++)
+            {
+              'path': files[i].path,
+              'mode': '100644',
+              'type': 'blob',
+              'sha': shas[i],
+            },
+        ],
+      },
+      action: 'إنشاء شجرة الملفات',
+    );
+    final commit = await _json(
+      'POST',
+      '/repos/${repo.fullName}/git/commits',
+      body: {
+        'message': message,
+        'tree': tree['sha'],
+        'parents': [parent],
+      },
+      action: 'إنشاء الـ Commit',
+    );
+    final sha = '${commit['sha']}';
+    await _json(
+      'PATCH',
+      '/repos/${repo.fullName}/git/refs/heads/${repo.branch}',
+      body: {'sha': sha, 'force': true},
+      action: 'تحديث الفرع',
+    );
+    return sha;
+  }
+
+  // ---------------------------------------------------------------- التشغيل
+
+  RunInfo _runFrom(Map<dynamic, dynamic> d) => RunInfo(
+        id: (d['id'] as num).toInt(),
+        status: '${d['status']}',
+        conclusion: d['conclusion'] as String?,
+        htmlUrl: '${d['html_url']}',
+      );
+
+  Future<List<RunInfo>> _listRuns(RepoRef r, String workflowFile) async {
+    final d = await _json(
+      'GET',
+      '/repos/${r.fullName}/actions/workflows/$workflowFile/runs',
+      query: {'per_page': '10', 'event': 'workflow_dispatch'},
+      action: 'قراءة تشغيلات البناء',
+    );
+    final runs = d['workflow_runs'];
+    if (runs is! List) return const [];
+    return runs.whereType<Map>().map(_runFrom).toList();
+  }
+
+  /// يشغّل الـ workflow ويرجع التشغيل الجديد.
+  Future<RunInfo> startWorkflow(RepoRef r, String workflowFile) async {
+    final before = <int>{};
+    try {
+      before.addAll((await _listRuns(r, workflowFile)).map((e) => e.id));
+    } on ApiException {
+      // الملف لم يُسجَّل بعد لدى GitHub؛ سنعيد المحاولة أدناه.
+    }
+
+    var dispatched = false;
+    for (var i = 0; i < 15 && !dispatched; i++) {
+      _cancel?.check();
+      final res = await _t.send(
+        'POST',
+        _uri('/repos/${r.fullName}/actions/workflows/$workflowFile/dispatches'),
+        headers: _headers,
+        body: jsonEncode({'ref': r.branch}),
+      );
+      if (res.statusCode == 204) {
+        dispatched = true;
+      } else if ((res.statusCode == 404 || res.statusCode == 422) && i < 14) {
+        // GitHub يحتاج بضع ثوانٍ لتسجيل ملف workflow جديد.
+        await _wait(const Duration(seconds: 4));
+      } else {
+        throw _error(res, 'تشغيل البناء ($workflowFile)');
+      }
+    }
+
+    for (var i = 0; i < 40; i++) {
+      await _wait(const Duration(seconds: 3));
+      final runs = await _listRuns(r, workflowFile);
+      final fresh = runs.where((e) => !before.contains(e.id)).toList()
+        ..sort((a, b) => b.id.compareTo(a.id));
+      if (fresh.isNotEmpty) return fresh.first;
+    }
+    throw FactoryException(
+      'لم يظهر تشغيل البناء على GitHub. افتح تبويب Actions في المستودع وتحقق من تفعيله.',
+    );
+  }
+
+  Future<RunInfo> getRun(RepoRef r, int runId) async {
+    final d = await _json(
+      'GET',
+      '/repos/${r.fullName}/actions/runs/$runId',
+      action: 'قراءة حالة البناء',
+    );
+    return _runFrom(d);
+  }
+
+  /// يتابع التشغيل حتى ينتهي، مع تحمّل أخطاء الشبكة المؤقتة.
+  Future<RunInfo> waitForRun(
+    RepoRef r,
+    int runId, {
+    void Function(RunInfo info)? onUpdate,
+    Duration timeout = const Duration(minutes: 45),
+    Duration interval = const Duration(seconds: 10),
+  }) async {
+    final started = DateTime.now();
+    var failures = 0;
+    while (true) {
+      _cancel?.check();
+      try {
+        final info = await getRun(r, runId);
+        failures = 0;
+        onUpdate?.call(info);
+        if (info.completed) return info;
+      } on NetworkException {
+        failures++;
+        if (failures >= 6) rethrow;
+      } on ApiException catch (e) {
+        final code = e.statusCode ?? 0;
+        if (code < 500 && code != 403 && code != 429) rethrow;
+        failures++;
+        if (failures >= 6) rethrow;
+      }
+      if (DateTime.now().difference(started) > timeout) {
+        throw const FactoryException('انتهت مهلة انتظار البناء (45 دقيقة).');
+      }
+      await _wait(interval);
+    }
+  }
+
+  // ---------------------------------------------------------------- النتائج
+
+  Future<List<ArtifactInfo>> listArtifacts(RepoRef r, int runId) async {
+    final d = await _json(
+      'GET',
+      '/repos/${r.fullName}/actions/runs/$runId/artifacts',
+      action: 'قراءة ملفات الإخراج',
+    );
+    final list = d['artifacts'];
+    if (list is! List) return const [];
+    return list.whereType<Map>().map((a) {
+      return ArtifactInfo(
+        id: (a['id'] as num).toInt(),
+        name: '${a['name']}',
+        sizeInBytes: (a['size_in_bytes'] as num?)?.toInt() ?? 0,
+        expired: a['expired'] == true,
+      );
+    }).toList();
+  }
+
+  /// ملف ZIP الخاص بالـ Artifact.
+  Future<Uint8List> downloadArtifact(RepoRef r, int artifactId) {
+    return _t.download(
+      _uri('/repos/${r.fullName}/actions/artifacts/$artifactId/zip'),
+      headers: _headers,
+    );
+  }
+
+  /// يفعّل GitHub Pages من فرع gh-pages. يرجع رابط الموقع أو null عند التعذر.
+  Future<String?> enablePages(RepoRef r) async {
+    final res = await _t.send(
+      'POST',
+      _uri('/repos/${r.fullName}/pages'),
+      headers: _headers,
+      body: jsonEncode({
+        'source': {'branch': 'gh-pages', 'path': '/'},
+      }),
+    );
+    if (res.statusCode == 201 || res.statusCode == 409) return r.pagesUrl;
+    return null;
+  }
+
+  /// خلاصة سبب الفشل: الخطوات الفاشلة + مقتطف من السجل، لإرسالها للنموذج.
+  Future<String> failureSummary(RepoRef r, int runId) async {
+    final out = StringBuffer();
+    try {
+      final jobs = await _json(
+        'GET',
+        '/repos/${r.fullName}/actions/runs/$runId/jobs',
+        action: 'قراءة مهام البناء',
+      );
+      final list = jobs['jobs'];
+      if (list is List) {
+        for (final j in list.whereType<Map>()) {
+          final steps = j['steps'];
+          if (steps is List) {
+            for (final s in steps.whereType<Map>()) {
+              if (s['conclusion'] == 'failure') {
+                out.writeln('Failed step: ${s['name']}');
+              }
+            }
+          }
+        }
+      }
+    } on FactoryException {
+      // نكمل بدون أسماء الخطوات.
+    }
+
+    try {
+      final zipBytes = await _t.download(
+        _uri('/repos/${r.fullName}/actions/runs/$runId/logs'),
+        headers: _headers,
+      );
+      final archive = ZipDecoder().decodeBytes(zipBytes);
+      final names = archive.files
+          .where((f) => f.isFile && !f.name.contains('/'))
+          .toList()
+        ..sort((a, b) => a.name.compareTo(b.name));
+      final text = StringBuffer();
+      for (final f in names) {
+        final c = f.content;
+        if (c is List<int>) text.writeln(utf8.decode(c, allowMalformed: true));
+      }
+      out.write(_condenseLog(text.toString()));
+    } on FactoryException {
+      out.writeln('(تعذر تنزيل سجل البناء)');
+    } catch (_) {
+      out.writeln('(تعذر قراءة سجل البناء)');
+    }
+    return out.toString();
+  }
+
+  static String _condenseLog(String raw) {
+    final ts = RegExp(r'^\d{4}-\d\d-\d\dT[\d:.]+Z ');
+    final ansi = RegExp('\u001B\\[[0-9;]*[A-Za-z]');
+    final lines = const LineSplitter()
+        .convert(raw)
+        .map((l) => l.replaceFirst(ts, '').replaceAll(ansi, ''))
+        .toList();
+    final errorLines = <String>[];
+    final seen = <String>{};
+    for (final l in lines) {
+      final low = l.toLowerCase();
+      if ((low.contains('error') ||
+              low.contains('exception') ||
+              low.contains('what went wrong') ||
+              low.contains('failed')) &&
+          !l.startsWith('##[group]') &&
+          seen.add(l)) {
+        errorLines.add(l);
+        if (errorLines.length >= 60) break;
+      }
+    }
+    final tail = lines.length > 80 ? lines.sublist(lines.length - 80) : lines;
+    final b = StringBuffer()
+      ..writeln('ERROR LINES:')
+      ..writeln(errorLines.join('\n'))
+      ..writeln()
+      ..writeln('LOG TAIL:')
+      ..writeln(tail.join('\n'));
+    final s = b.toString();
+    return s.length > 12000 ? s.substring(s.length - 12000) : s;
+  }
+}
