@@ -1,0 +1,50 @@
+name: Build Flutter APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Generate Android platform files
+        run: |
+          HAD_WIDGET_TEST=0
+          if [ -f test/widget_test.dart ]; then HAD_WIDGET_TEST=1; fi
+          flutter create . --platforms=android --project-name ai_app_factory --org com.example
+          if [ "$HAD_WIDGET_TEST" = "0" ]; then rm -f test/widget_test.dart; fi
+      - name: Patch Android manifest (internet + background service)
+        run: python3 tool/setup_android.py
+      - name: Verify INTERNET permission is in the manifest
+        run: grep -q 'android.permission.INTERNET' android/app/src/main/AndroidManifest.xml
+      - name: Install dependencies
+        run: flutter pub get
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+      - name: Set app label
+        run: sed -i 's/android:label="[^"]*"/android:label="مصنع التطبيقات"/' android/app/src/main/AndroidManifest.xml
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+        continue-on-error: true
+      - name: Test
+        run: if [ -d test ]; then flutter test; else echo "No tests found"; fi
+      - name: Build release APK
+        run: flutter build apk --release
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: build/app/outputs/flutter-apk/app-release.apk
