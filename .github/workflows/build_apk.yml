@@ -27,6 +27,32 @@ jobs:
       - name: Generate Android project
         run: flutter create --platforms=android .
 
+      - name: Add Android permissions
+        run: |
+          python3 - <<'EOF'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          perms = (
+              '<uses-permission android:name="android.permission.INTERNET"/>\n'
+              '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>\n'
+              '    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n'
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n'
+              '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>\n'
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n'
+              '    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>\n'
+              '    '
+          )
+          service = (
+              '<service android:name="com.pravera.flutter_foreground_task.service.ForegroundService"\n'
+              '            android:foregroundServiceType="dataSync"\n'
+              '            android:exported="false"/>\n'
+              '    '
+          )
+          s = s.replace('<application', perms + '<application', 1)
+          s = s.replace('</application>', service + '</application>', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          EOF
+
       - name: Install Android NDK
         run: |
           SDKMANAGER=$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager
